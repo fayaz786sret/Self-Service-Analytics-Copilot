@@ -27,6 +27,10 @@ class Settings:
     OPENAI_API_KEY: str = _read_secret("OPENAI_API_KEY", "")
     OPENAI_MODEL: str = _read_secret("OPENAI_MODEL", "gpt-4")
     
+    # Groq Config
+    GROQ_API_KEY: str = _read_secret("GROQ_API_KEY", "")
+    GROQ_MODEL: str = _read_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
+    
     # FastAPI Config
     API_TITLE: str = "Data Analysis Pipeline API"
     API_VERSION: str = "0.1.0"

@@ -8,6 +8,12 @@ from uuid import uuid4
 import pandas as pd
 import requests
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy import stats
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error, accuracy_score, confusion_matrix
 
 from config import settings
 from services.run_store import RunStore
@@ -472,13 +478,13 @@ def fetch_run_details(run_id: str, backend_mode: str) -> dict | None:
     return None
 
 
-def ask_copilot(question: str, run_id: str | None, backend_mode: str) -> dict | None:
+def ask_copilot(question: str, run_id: str | None, backend_mode: str) -> dict:
     """Ask the analytics copilot about a selected run."""
     if backend_mode == "embedded":
         run_store = get_run_store()
         run_record = run_store.get_run(run_id) if run_id else run_store.latest_run()
         if not run_record:
-            return None
+            return {"status": "error", "answer": "⚠️ No saved run context was available for this dataset."}
         answer = get_copilot_agent().answer(question, run_record)
         return {
             "run_id": run_record["run_id"],
@@ -490,13 +496,18 @@ def ask_copilot(question: str, run_id: str | None, backend_mode: str) -> dict | 
         response = requests.post(
             f"{API_URL}/copilot/ask",
             json={"question": question, "run_id": run_id},
-            timeout=30,
+            timeout=60,
         )
         if response.status_code == 200:
             return response.json()
-    except Exception:
-        return None
-    return None
+        elif response.status_code == 404:
+            return {"status": "error", "answer": "⚠️ No saved run was found on the server. Please run or select an analysis first."}
+        else:
+            return {"status": "error", "answer": f"⚠️ Server error ({response.status_code}): {response.text}"}
+    except requests.exceptions.Timeout:
+        return {"status": "error", "answer": "⚠️ Copilot request timed out after 60s. The AI model is taking too long to respond."}
+    except Exception as exc:
+        return {"status": "error", "answer": f"⚠️ Could not reach backend server at {API_URL}: {exc}"}
 
 
 def load_uploaded_dataframe(uploaded_file) -> pd.DataFrame:
@@ -504,46 +515,173 @@ def load_uploaded_dataframe(uploaded_file) -> pd.DataFrame:
     return DataLoaderTool.load_uploaded_file(uploaded_file)
 
 
-def render_histogram_like_chart(df: pd.DataFrame, column: str):
-    """Render a histogram-like chart using binned counts."""
+def render_correlation_heatmap(df: pd.DataFrame, key: str | None = None):
+    """Render an interactive correlation heatmap using Plotly."""
+    numeric_df = df.select_dtypes(include=["number"])
+    if numeric_df.shape[1] < 2:
+        st.info("At least 2 numeric columns are required to compute a correlation heatmap.")
+        return
+    corr = numeric_df.corr().round(2)
+    fig = px.imshow(
+        corr,
+        text_auto=True,
+        aspect="auto",
+        color_continuous_scale="RdBu_r",
+        zmin=-1,
+        zmax=1,
+        title="Pairwise Pearson Correlation Heatmap",
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
+def render_box_plot(df: pd.DataFrame, column: str, group_by: str | None = None, is_violin: bool = False, key: str | None = None):
+    """Render an interactive box or violin plot for distribution and outlier inspection."""
+    series = pd.to_numeric(df[column], errors="coerce").dropna()
+    if series.empty:
+        st.info(f"No numeric values available for `{column}`.")
+        return
+    plot_df = df.copy()
+    plot_df[column] = pd.to_numeric(plot_df[column], errors="coerce")
+    plot_df = plot_df.dropna(subset=[column])
+    
+    if is_violin:
+        fig = px.violin(
+            plot_df,
+            y=column,
+            x=group_by,
+            color=group_by,
+            box=True,
+            points="outliers",
+            title=f"Violin & Kernel Density Plot: {column}",
+        )
+    else:
+        fig = px.box(
+            plot_df,
+            y=column,
+            x=group_by,
+            color=group_by,
+            points="outliers",
+            title=f"Box Plot & Outlier Fences: {column}",
+        )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
+def render_pie_chart(df: pd.DataFrame, column: str, key: str | None = None):
+    """Render an interactive Donut / Pie chart for qualitative feature breakdown."""
+    counts = df[column].astype(str).fillna("Missing").value_counts().head(10)
+    fig = px.pie(
+        values=counts.values,
+        names=counts.index,
+        hole=0.45,
+        title=f"Category Distribution: {column}",
+        color_discrete_sequence=px.colors.qualitative.Prism,
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
+
+def render_histogram_like_chart(df: pd.DataFrame, column: str, key: str | None = None):
+    """Render an interactive distribution histogram with Plotly."""
     series = pd.to_numeric(df[column], errors="coerce").dropna()
     if series.empty:
         st.info(f"No numeric data available for `{column}`.")
         return
+    fig = px.histogram(
+        df,
+        x=column,
+        marginal="box",
+        nbins=min(30, max(10, int(series.nunique() ** 0.5))),
+        title=f"Distribution Histogram: {column}",
+        color_discrete_sequence=["#ff9347"],
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
-    bins = min(20, max(5, int(series.nunique() ** 0.5)))
-    bucketed = pd.cut(series, bins=bins)
-    counts = bucketed.value_counts().sort_index()
-    chart_df = pd.DataFrame(
-        {
-            "range": counts.index.astype(str),
-            "count": counts.values,
-        }
-    ).set_index("range")
-    st.bar_chart(chart_df)
 
-
-def render_scatter_chart(df: pd.DataFrame, x_col: str, y_col: str):
-    """Render a scatter chart for two numeric columns."""
-    chart_df = df[[x_col, y_col]].copy()
+def render_scatter_chart(df: pd.DataFrame, x_col: str, y_col: str, color_col: str | None = None, key: str | None = None):
+    """Render an interactive scatter chart with OLS trendline."""
+    chart_df = df[[x_col, y_col] + ([color_col] if color_col else [])].copy()
     chart_df[x_col] = pd.to_numeric(chart_df[x_col], errors="coerce")
     chart_df[y_col] = pd.to_numeric(chart_df[y_col], errors="coerce")
-    chart_df = chart_df.dropna().head(2000)
+    chart_df = chart_df.dropna(subset=[x_col, y_col]).head(2000)
 
     if chart_df.empty:
-        st.info(f"No usable rows found for `{x_col}` vs `{y_col}`.")
+        st.info(f"No usable numeric pairs found for `{x_col}` vs `{y_col}`.")
         return
 
-    st.scatter_chart(chart_df, x=x_col, y=y_col)
+    trendline = "ols" if len(chart_df) >= 4 else None
+    try:
+        fig = px.scatter(
+            chart_df,
+            x=x_col,
+            y=y_col,
+            color=color_col,
+            trendline=trendline,
+            title=f"Bivariate Scatter Plot: {x_col} vs {y_col}",
+            color_discrete_sequence=px.colors.qualitative.Safe,
+        )
+    except Exception:
+        fig = px.scatter(
+            chart_df,
+            x=x_col,
+            y=y_col,
+            color=color_col,
+            title=f"Bivariate Scatter Plot: {x_col} vs {y_col}",
+        )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def render_categorical_bar_chart(df: pd.DataFrame, column: str):
-    """Render category frequencies."""
-    counts = df[column].astype(str).fillna("Missing").value_counts().head(15)
-    st.bar_chart(counts)
+def render_categorical_bar_chart(df: pd.DataFrame, column: str, key: str | None = None):
+    """Render category frequencies with Plotly."""
+    counts = df[column].astype(str).fillna("Missing").value_counts().head(15).reset_index()
+    counts.columns = [column, "count"]
+    fig = px.bar(
+        counts,
+        x=column,
+        y="count",
+        text="count",
+        title=f"Category Frequencies: {column}",
+        color="count",
+        color_continuous_scale="Viridis",
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
 
 
-def render_missingness_chart(profile: dict):
+def render_missingness_chart(profile: dict, key: str | None = None):
     """Render missing-value percentages from profile output."""
     missing = profile.get("missing_percentage", {})
     if not missing:
@@ -552,12 +690,27 @@ def render_missingness_chart(profile: dict):
 
     chart_df = (
         pd.DataFrame(
-            [{"column": column, "missing_pct": value} for column, value in missing.items()]
+            [{"column": column, "missing_pct": round(value, 2)} for column, value in missing.items()]
         )
         .sort_values("missing_pct", ascending=False)
-        .set_index("column")
     )
-    st.bar_chart(chart_df)
+    fig = px.bar(
+        chart_df,
+        x="column",
+        y="missing_pct",
+        text="missing_pct",
+        title="Missing Value Percentage by Column (%)",
+        color="missing_pct",
+        color_continuous_scale="Reds",
+    )
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#edf3ef"),
+        margin=dict(l=20, r=20, t=40, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key)
+
 
 
 def render_metric_card(label: str, value: str, note: str = ""):
@@ -667,6 +820,12 @@ def main():
                     }
                     st.session_state.last_uploaded_name = run_record.get("file_name")
                     st.session_state.selected_run_id = run_record.get("run_id")
+                    file_path = run_record.get("file_path")
+                    if file_path and Path(file_path).exists():
+                        try:
+                            st.session_state.analysis_dataframe = DataLoaderTool.load_file(file_path)
+                        except Exception:
+                            pass
                     st.session_state.copilot_messages = []
         else:
             st.caption("No saved runs yet. Upload data to create your first workspace.")
@@ -891,7 +1050,7 @@ def main():
                         result.get("run_id") or st.session_state.get("selected_run_id"),
                         backend_mode,
                     )
-                    if reply:
+                    if reply and reply.get("answer"):
                         st.session_state.copilot_messages.append(
                             {"role": "user", "content": question}
                         )
@@ -899,7 +1058,7 @@ def main():
                             {"role": "assistant", "content": reply.get("answer", ""), "mode": reply.get("mode", "")}
                         )
                     else:
-                        st.error("Copilot request failed. No saved run context was available.")
+                        st.error("Copilot request failed. No response received from server.")
 
         for message in st.session_state.get("copilot_messages", []):
             with st.chat_message(message["role"]):
@@ -907,8 +1066,16 @@ def main():
                 if message.get("mode"):
                     st.caption(f"Mode: {message['mode']}")
         
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["Profile", "Anomalies", "Insights", "Visualizations", "Report"]
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+            [
+                "Profile",
+                "Anomalies",
+                "Visualizations & Heatmaps",
+                "Insights",
+                "Diagnostic Tests",
+                "Predictive ML",
+                "Report",
+            ]
         )
         
         with tab1:
@@ -923,7 +1090,7 @@ def main():
 
                 missing_pct = profile.get("missing_percentage", {})
                 missing_df = pd.DataFrame(
-                    [{"column": col, "missing_pct": pct} for col, pct in missing_pct.items()]
+                    [{"column": col, "missing_pct": round(pct, 2)} for col, pct in missing_pct.items()]
                 ).sort_values("missing_pct", ascending=False)
                 st.dataframe(missing_df, use_container_width=True)
             else:
@@ -946,6 +1113,126 @@ def main():
                 st.info("No anomaly results returned.")
         
         with tab3:
+            st.subheader("Visualizations & Interactive Heatmaps")
+            visualizations = result.get("visualizations", {})
+            completed_steps = result.get("completed_steps", [])
+            analysis_df = st.session_state.get("analysis_dataframe")
+
+            if analysis_df is not None:
+                numeric_cols = list(analysis_df.select_dtypes(include=["number"]).columns)
+                categorical_cols = list(analysis_df.select_dtypes(include=["object", "category"]).columns)
+
+                # 1. Interactive Studio Selector
+                with st.expander("🎨 Interactive Chart Studio (Custom Visualizations)", expanded=True):
+                    studio_cols = st.columns([2, 2, 2])
+                    with studio_cols[0]:
+                        chart_choice = st.selectbox(
+                            "Choose Chart Type",
+                            [
+                                "Correlation Heatmap",
+                                "Box Plot (Outlier Analysis)",
+                                "Violin Plot (KDE Density)",
+                                "Distribution Histogram",
+                                "Bivariate Scatter Plot (with OLS Trendline)",
+                                "Donut / Pie Chart (Proportions)",
+                                "Category Bar Chart",
+                            ],
+                            key="studio_chart_type",
+                        )
+                    
+                    if chart_choice == "Correlation Heatmap":
+                        render_correlation_heatmap(analysis_df, key="studio_heatmap")
+                    elif chart_choice in ["Box Plot (Outlier Analysis)", "Violin Plot (KDE Density)"]:
+                        if numeric_cols:
+                            with studio_cols[1]:
+                                num_col = st.selectbox("Numeric Column", numeric_cols, key="box_num_col")
+                            with studio_cols[2]:
+                                grp_col = st.selectbox("Optional Grouping (Category)", ["None"] + categorical_cols, key="box_grp_col")
+                            render_box_plot(
+                                analysis_df,
+                                num_col,
+                                group_by=None if grp_col == "None" else grp_col,
+                                is_violin=(chart_choice == "Violin Plot (KDE Density)"),
+                                key="studio_box_plot",
+                            )
+                        else:
+                            st.info("No numeric columns found for box/violin plot.")
+                    elif chart_choice == "Distribution Histogram":
+                        if numeric_cols:
+                            with studio_cols[1]:
+                                num_col = st.selectbox("Select Column", numeric_cols, key="hist_num_col")
+                            render_histogram_like_chart(analysis_df, num_col, key="studio_hist_plot")
+                        else:
+                            st.info("No numeric columns found for histogram.")
+                    elif chart_choice == "Bivariate Scatter Plot (with OLS Trendline)":
+                        if len(numeric_cols) >= 2:
+                            with studio_cols[1]:
+                                x_c = st.selectbox("X-Axis (Independent)", numeric_cols, index=0, key="scatter_x")
+                            with studio_cols[2]:
+                                y_c = st.selectbox("Y-Axis (Dependent)", numeric_cols, index=1, key="scatter_y")
+                            color_c = st.selectbox("Color Grouping", ["None"] + categorical_cols, key="scatter_color")
+                            render_scatter_chart(
+                                analysis_df,
+                                x_c,
+                                y_c,
+                                color_col=None if color_c == "None" else color_c,
+                                key="studio_scatter_plot",
+                            )
+                        else:
+                            st.info("At least 2 numeric columns are required for a scatter plot.")
+                    elif chart_choice == "Donut / Pie Chart (Proportions)":
+                        if categorical_cols:
+                            with studio_cols[1]:
+                                cat_col = st.selectbox("Select Categorical Column", categorical_cols, key="pie_cat_col")
+                            render_pie_chart(analysis_df, cat_col, key="studio_pie_chart")
+                        else:
+                            st.info("No categorical columns found for pie chart.")
+                    elif chart_choice == "Category Bar Chart":
+                        if categorical_cols:
+                            with studio_cols[1]:
+                                cat_col = st.selectbox("Select Column", categorical_cols, key="bar_cat_col")
+                            render_categorical_bar_chart(analysis_df, cat_col, key="studio_bar_chart")
+                        else:
+                            st.info("No categorical columns found for bar chart.")
+
+                st.divider()
+                st.markdown("### Automated Pipeline Recommendations")
+                charts = visualizations.get("recommended_charts", [])
+                if charts:
+                    for idx, chart in enumerate(charts):
+                        chart_type = chart.get("chart_type")
+                        columns = chart.get("columns", [])
+                        st.markdown(f"**{chart_type.replace('_', ' ').title()}**")
+                        st.caption(chart.get("reason", ""))
+
+                        if chart_type == "correlation_heatmap":
+                            render_correlation_heatmap(analysis_df, key=f"rec_heatmap_{idx}")
+                        elif chart_type == "box_plot" and columns:
+                            render_box_plot(analysis_df, columns[0], key=f"rec_box_{idx}")
+                        elif chart_type == "pie_chart" and columns:
+                            render_pie_chart(analysis_df, columns[0], key=f"rec_pie_{idx}")
+                        elif chart_type == "summary_card":
+                            metrics = st.columns(3)
+                            metrics[0].metric("Rows", f"{profile.get('shape', {}).get('rows', 0):,}")
+                            metrics[1].metric("Columns", f"{profile.get('shape', {}).get('columns', 0)}")
+                            metrics[2].metric(
+                                "Flagged Rows",
+                                f"{result.get('anomalies', {}).get('total_anomalous_rows', 0):,}",
+                            )
+                        elif chart_type == "missingness_bar":
+                            render_missingness_chart(profile, key=f"rec_missing_{idx}")
+                        elif chart_type == "histogram" and columns:
+                            render_histogram_like_chart(analysis_df, columns[0], key=f"rec_hist_{idx}")
+                        elif chart_type == "scatter" and len(columns) >= 2:
+                            render_scatter_chart(analysis_df, columns[0], columns[1], key=f"rec_scatter_{idx}")
+                        elif chart_type == "bar" and columns:
+                            render_categorical_bar_chart(analysis_df, columns[0], key=f"rec_bar_{idx}")
+                else:
+                    st.info("No automated chart recommendations recorded.")
+            else:
+                st.info("Upload a dataset or load a run to render interactive charts and heatmaps.")
+        
+        with tab4:
             st.subheader("Generated Insights")
             insights = result.get("insights", {})
             if insights:
@@ -971,57 +1258,241 @@ def main():
                 else:
                     st.info("Insight generation is not implemented yet.")
         
-        with tab4:
-            st.subheader("Visualizations")
-            visualizations = result.get("visualizations", {})
-            completed_steps = result.get("completed_steps", [])
-            analysis_df = st.session_state.get("analysis_dataframe")
-            if visualizations:
-                st.markdown(visualizations.get("dashboard_notes", ""))
-                charts = visualizations.get("recommended_charts", [])
-                if charts:
-                    st.dataframe(pd.DataFrame(charts), use_container_width=True)
-                    st.divider()
-                    st.markdown("### Rendered Charts")
-
-                    profile = result.get("profile", {})
-                    for chart in charts:
-                        chart_type = chart.get("chart_type")
-                        columns = chart.get("columns", [])
-                        st.markdown(f"**{chart_type.replace('_', ' ').title()}**")
-                        st.caption(chart.get("reason", ""))
-
-                        if chart_type == "summary_card":
-                            metrics = st.columns(3)
-                            metrics[0].metric("Rows", f"{profile.get('shape', {}).get('rows', 0):,}")
-                            metrics[1].metric("Columns", f"{profile.get('shape', {}).get('columns', 0)}")
-                            metrics[2].metric(
-                                "Flagged Rows",
-                                f"{result.get('anomalies', {}).get('total_anomalous_rows', 0):,}",
-                            )
-                        elif chart_type == "missingness_bar":
-                            render_missingness_chart(profile)
-                        elif analysis_df is None:
-                            st.info("Uploaded dataframe is not available in session. Rerun the analysis to render charts.")
-                        elif chart_type == "histogram" and columns:
-                            render_histogram_like_chart(analysis_df, columns[0])
-                        elif chart_type == "scatter" and len(columns) >= 2:
-                            render_scatter_chart(analysis_df, columns[0], columns[1])
-                        elif chart_type == "bar" and columns:
-                            render_categorical_bar_chart(analysis_df, columns[0])
-                        else:
-                            st.info("No renderer implemented for this recommendation yet.")
-                else:
-                    st.info("No chart recommendations returned.")
-            else:
-                if "skip_visualizations" in completed_steps:
-                    st.warning("Visualization generation was skipped for this run. Enable `Create Visualizations` and run the analysis again.")
-                elif "create_visualizations" not in completed_steps:
-                    st.warning("This result appears to come from an older backend response that did not execute the visualization node. Restart the FastAPI backend and rerun the analysis.")
-                else:
-                    st.warning("Visualization node ran but returned no recommendations. Check the workflow trace for details.")
-        
         with tab5:
+            st.subheader("Diagnostic Analytics & Hypothesis Testing")
+            st.caption("Apply inferential statistics to test root causes, group differences, and categorical associations.")
+            analysis_df = st.session_state.get("analysis_dataframe")
+
+            if analysis_df is not None:
+                numeric_cols = list(analysis_df.select_dtypes(include=["number"]).columns)
+                categorical_cols = list(analysis_df.select_dtypes(include=["object", "category"]).columns)
+
+                test_type = st.selectbox(
+                    "Choose Statistical Test",
+                    [
+                        "Two-Sample Independent T-Test (Compare 2 Groups)",
+                        "One-Way ANOVA (Compare 3+ Groups)",
+                        "Chi-Square Test of Independence (Categorical Association)",
+                    ],
+                )
+
+                if test_type == "Two-Sample Independent T-Test (Compare 2 Groups)":
+                    if numeric_cols and categorical_cols:
+                        tc1, tc2 = st.columns(2)
+                        with tc1:
+                            metric_col = st.selectbox("Continuous Metric (Numeric)", numeric_cols, key="ttest_metric")
+                        with tc2:
+                            group_col = st.selectbox("Grouping Variable (Categorical)", categorical_cols, key="ttest_group")
+                        
+                        unique_groups = list(analysis_df[group_col].dropna().unique())
+                        if len(unique_groups) >= 2:
+                            gc1, gc2 = st.columns(2)
+                            with gc1:
+                                grp1 = st.selectbox("Group A", unique_groups, index=0, key="ttest_g1")
+                            with gc2:
+                                grp2 = st.selectbox("Group B", unique_groups, index=1, key="ttest_g2")
+                            
+                            if grp1 != grp2:
+                                s1 = pd.to_numeric(analysis_df[analysis_df[group_col] == grp1][metric_col], errors="coerce").dropna()
+                                s2 = pd.to_numeric(analysis_df[analysis_df[group_col] == grp2][metric_col], errors="coerce").dropna()
+
+                                if len(s1) > 2 and len(s2) > 2:
+                                    t_stat, p_val = stats.ttest_ind(s1, s2, equal_var=False)
+                                    res_cols = st.columns(4)
+                                    res_cols[0].metric(f"Mean ({grp1})", f"{s1.mean():,.2f}")
+                                    res_cols[1].metric(f"Mean ({grp2})", f"{s2.mean():,.2f}")
+                                    res_cols[2].metric("t-Statistic", f"{t_stat:.3f}")
+                                    res_cols[3].metric("p-Value", f"{p_val:.4e}")
+
+                                    st.markdown(f"**$H_0$ (Null Hypothesis):** Mean `{metric_col}` for `{grp1}` = Mean `{metric_col}` for `{grp2}`.")
+                                    st.markdown(f"**$H_1$ (Alternative):** There is a significant difference between `{grp1}` and `{grp2}`.")
+
+                                    if p_val < 0.05:
+                                        st.success(f"🟢 **Statistically Significant (p = {p_val:.4f} < 0.05)**: Reject $H_0$. There is strong evidence that `{grp1}` and `{grp2}` have significantly different mean `{metric_col}`.")
+                                    else:
+                                        st.info(f"⚪ **Not Statistically Significant (p = {p_val:.4f} ≥ 0.05)**: Fail to reject $H_0$. No significant difference in `{metric_col}` detected between `{grp1}` and `{grp2}`.")
+                                else:
+                                    st.warning("Insufficient samples in one or both selected groups.")
+                            else:
+                                st.warning("Please choose two different groups.")
+                        else:
+                            st.warning(f"`{group_col}` must have at least 2 distinct categories.")
+                    else:
+                        st.info("Requires at least 1 numeric column and 1 categorical column.")
+
+                elif test_type == "One-Way ANOVA (Compare 3+ Groups)":
+                    if numeric_cols and categorical_cols:
+                        ac1, ac2 = st.columns(2)
+                        with ac1:
+                            metric_col = st.selectbox("Continuous Metric (Numeric)", numeric_cols, key="anova_metric")
+                        with ac2:
+                            group_col = st.selectbox("Grouping Variable (3+ Groups)", categorical_cols, key="anova_group")
+                        
+                        groups_data = [
+                            pd.to_numeric(group[metric_col], errors="coerce").dropna()
+                            for _, group in analysis_df.groupby(group_col)
+                        ]
+                        groups_data = [g for g in groups_data if len(g) > 2]
+
+                        if len(groups_data) >= 3:
+                            f_stat, p_val = stats.f_oneway(*groups_data)
+                            res_cols = st.columns(3)
+                            res_cols[0].metric("Number of Groups", len(groups_data))
+                            res_cols[1].metric("F-Statistic", f"{f_stat:.3f}")
+                            res_cols[2].metric("p-Value", f"{p_val:.4e}")
+
+                            st.markdown(f"**$H_0$ (Null):** All group means of `{metric_col}` are equal across `{group_col}`.")
+                            st.markdown(f"**$H_1$ (Alternative):** At least one group mean is significantly different.")
+
+                            if p_val < 0.05:
+                                st.success(f"🟢 **Statistically Significant (p = {p_val:.4f} < 0.05)**: Reject $H_0$. At least one category in `{group_col}` exhibits a significantly different `{metric_col}`.")
+                            else:
+                                st.info(f"⚪ **Not Significant (p = {p_val:.4f} ≥ 0.05)**: Fail to reject $H_0$. Group means do not differ significantly.")
+                        else:
+                            st.warning(f"`{group_col}` needs at least 3 distinct groups with sufficient rows for ANOVA.")
+                    else:
+                        st.info("Requires at least 1 numeric column and 1 categorical column.")
+
+                elif test_type == "Chi-Square Test of Independence (Categorical Association)":
+                    if len(categorical_cols) >= 2:
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            cat1 = st.selectbox("First Categorical Feature", categorical_cols, index=0, key="chi_cat1")
+                        with cc2:
+                            cat2 = st.selectbox("Second Categorical Feature", categorical_cols, index=1, key="chi_cat2")
+                        
+                        if cat1 != cat2:
+                            contingency = pd.crosstab(analysis_df[cat1].fillna("Missing"), analysis_df[cat2].fillna("Missing"))
+                            chi2, p_val, dof, _ = stats.chi2_contingency(contingency)
+
+                            c_cols = st.columns(3)
+                            c_cols[0].metric("Chi-Square (χ²)", f"{chi2:.3f}")
+                            c_cols[1].metric("Degrees of Freedom", dof)
+                            c_cols[2].metric("p-Value", f"{p_val:.4e}")
+
+                            st.markdown("**Contingency Table:**")
+                            st.dataframe(contingency, use_container_width=True)
+
+                            st.markdown(f"**$H_0$:** `{cat1}` and `{cat2}` are independent.")
+                            st.markdown(f"**$H_1$:** `{cat1}` and `{cat2}` are significantly associated.")
+
+                            if p_val < 0.05:
+                                st.success(f"🟢 **Significant Association (p = {p_val:.4f} < 0.05)**: Reject $H_0$. There is a statistically significant relationship between `{cat1}` and `{cat2}`.")
+                            else:
+                                st.info(f"⚪ **Independent (p = {p_val:.4f} ≥ 0.05)**: Fail to reject $H_0$. No significant association detected between `{cat1}` and `{cat2}`.")
+                        else:
+                            st.warning("Please choose two different categorical variables.")
+                    else:
+                        st.info("Requires at least 2 categorical columns for Chi-Square test.")
+            else:
+                st.info("Upload a dataset to run diagnostic hypothesis tests.")
+
+        with tab6:
+            st.subheader("Predictive Analytics & Machine Learning")
+            st.caption("Define target labels and predictor features to train and evaluate supervised learning models.")
+            analysis_df = st.session_state.get("analysis_dataframe")
+
+            if analysis_df is not None:
+                all_cols = list(analysis_df.columns)
+                target_col = st.selectbox("Select Target Label (y)", all_cols, key="ml_target")
+                candidate_features = [c for c in all_cols if c != target_col]
+                selected_features = st.multiselect(
+                    "Select Feature Columns (X)",
+                    candidate_features,
+                    default=candidate_features[:min(4, len(candidate_features))],
+                    key="ml_features",
+                )
+
+                is_numeric_target = pd.api.types.is_numeric_dtype(analysis_df[target_col])
+                model_task = "Regression (Continuous Target)" if is_numeric_target else "Classification (Discrete Classes)"
+                st.caption(f"Task Auto-Detected: **{model_task}**")
+
+                if st.button("🚀 Train & Evaluate Model", type="primary", use_container_width=True):
+                    if not selected_features:
+                        st.error("Please select at least one feature column.")
+                    else:
+                        # Prepare data
+                        df_clean = analysis_df[[target_col] + selected_features].copy()
+                        # Impute or drop
+                        df_clean = df_clean.dropna()
+
+                        if len(df_clean) < 10:
+                            st.error("Insufficient complete rows after dropping missing values.")
+                        else:
+                            # Encode categorical features
+                            X_raw = df_clean[selected_features]
+                            X = pd.get_dummies(X_raw, drop_first=True)
+                            y = df_clean[target_col]
+
+                            if is_numeric_target:
+                                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                                model = LinearRegression()
+                                model.fit(X_train, y_train)
+                                y_pred = model.predict(X_test)
+
+                                r2 = r2_score(y_test, y_pred)
+                                mse = mean_squared_error(y_test, y_pred)
+                                rmse = mse ** 0.5
+
+                                mc1, mc2, mc3 = st.columns(3)
+                                mc1.metric("R² Score (Variance Explained)", f"{r2:.3f}")
+                                mc2.metric("RMSE (Root Mean Sq Error)", f"{rmse:,.2f}")
+                                mc3.metric("MSE", f"{mse:,.2f}")
+
+                                # Feature coefficients
+                                coef_df = pd.DataFrame(
+                                    {"Feature": X.columns, "Coefficient": model.coef_}
+                                ).sort_values("Coefficient", ascending=False)
+                                fig_coef = px.bar(
+                                    coef_df,
+                                    x="Feature",
+                                    y="Coefficient",
+                                    title="Feature Importance (Regression Coefficients)",
+                                    color="Coefficient",
+                                    color_continuous_scale="Tealgrn",
+                                )
+                                fig_coef.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#edf3ef"))
+                                st.plotly_chart(fig_coef, use_container_width=True, key="ml_coef_plot")
+
+                                # Predicted vs Actual Plot
+                                pred_df = pd.DataFrame({"Actual": y_test, "Predicted": y_pred})
+                                fig_pred = px.scatter(
+                                    pred_df,
+                                    x="Actual",
+                                    y="Predicted",
+                                    title="Actual vs Predicted Values",
+                                    trendline="ols",
+                                )
+                                fig_pred.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#edf3ef"))
+                                st.plotly_chart(fig_pred, use_container_width=True, key="ml_pred_plot")
+                            else:
+                                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+                                model = LogisticRegression(max_iter=1000)
+                                model.fit(X_train, y_train)
+                                y_pred = model.predict(X_test)
+                                acc = accuracy_score(y_test, y_pred)
+
+                                ac1, ac2 = st.columns(2)
+                                ac1.metric("Model Accuracy", f"{acc * 100:.1f}%")
+                                ac2.metric("Classes Evaluated", len(y.unique()))
+
+                                # Confusion matrix
+                                cm = confusion_matrix(y_test, y_pred, labels=model.classes_)
+                                fig_cm = px.imshow(
+                                    cm,
+                                    x=[str(c) for c in model.classes_],
+                                    y=[str(c) for c in model.classes_],
+                                    text_auto=True,
+                                    color_continuous_scale="Blues",
+                                    title="Classification Confusion Matrix",
+                                    labels=dict(x="Predicted Class", y="Actual Class"),
+                                )
+                                fig_cm.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#edf3ef"))
+                                st.plotly_chart(fig_cm, use_container_width=True, key="ml_cm_plot")
+            else:
+                st.info("Upload a dataset to train and evaluate predictive models.")
+
+        with tab7:
             st.subheader("Full Report")
             report = result.get("report", {})
             if report.get("content"):
@@ -1036,6 +1507,7 @@ def main():
                         "error": result.get("error"),
                     }
                 )
+
 
 
 if __name__ == "__main__":
